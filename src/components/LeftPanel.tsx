@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowRight, Box, FileUp, Loader2, Check, Circle, Cone, Cpu, Cylinder, Eye, EyeOff, Hammer, Hexagon, ImagePlus, Link2, ListTree, MapPin, Package, Plus, Ruler, Shapes, Sparkles, Triangle, Wand2, X,
+  AirVent, AlertTriangle, Cable, Ear, MoveHorizontal, PanelBottom, PenTool, Server, ArrowRight, Box, Drill, PackageOpen, FileUp, Loader2, Check, Circle, Cone, CornerDownRight, Cpu, Cylinder, Eye, EyeOff, Hammer, Hexagon, ImagePlus, Link2, ListTree, Magnet, MapPin, Package, Plus, RectangleHorizontal, Ruler, Shapes, Sparkles, Triangle, Wand2, X,
 } from "lucide-react";
 import { readFileAsDataUrl } from "../ai/image";
 import { PROVIDERS } from "../ai/llm";
 import { ACCEPT_ATTR } from "../cad/importers";
-import { PRIMITIVES, TEMPLATES } from "../cad/templates";
+import { FASTENERS, PRIMITIVES, RACKS, SKETCH, TEMPLATES } from "../cad/templates";
+import { useSketchEditor } from "./SketchEditor";
 import { isMac } from "../lib/platform";
 import { pendingMeasurements, useStore, type LeftTab } from "../store";
 import { Button, Kbd, Pill, SectionTitle, cx } from "./ui";
+import { ModelingTools } from "./ModelingTools";
+import { VariablesPanel } from "./VariablesPanel";
 
 export const SHAPE_ICONS: Record<string, typeof Box> = {
   box: Box,
@@ -19,12 +22,25 @@ export const SHAPE_ICONS: Record<string, typeof Box> = {
   wedge: Triangle,
   prism: Hexagon,
   torus: Circle,
+  "rounded-plate": RectangleHorizontal,
+  slot: RectangleHorizontal,
+  "profile-l": CornerDownRight,
+  "profile-u": Magnet,
   "marker-holder": Wand2,
   "wall-hook": Link2,
   "pipe-clip": Hammer,
   imported: FileUp,
   "l-bracket": Ruler,
   organizer: Package,
+  enclosure: PackageOpen,
+  "screw-hole": Drill,
+  vent: AirVent,
+  sketch: PenTool,
+  "rack-panel": Server,
+  "rack-shelf": PanelBottom,
+  "rack-ears": Ear,
+  "adjustable-bracket": MoveHorizontal,
+  "cable-pass": Cable,
 };
 export const iconFor = (type: string) => SHAPE_ICONS[type] ?? Package;
 
@@ -73,7 +89,8 @@ function InsertTab() {
         <ImportButton />
       </div>
       <ImportErrors />
-      <SectionTitle>Formas básicas</SectionTitle>
+      <ModelingTools />
+      <SectionTitle>Figuras y perfiles</SectionTitle>
       <div className="grid grid-cols-3 gap-1.5 px-4">
         {PRIMITIVES.map((t) => {
           const Icon = iconFor(t.id);
@@ -85,23 +102,57 @@ function InsertTab() {
           );
         })}
       </div>
-      <SectionTitle>Componentes paramétricos</SectionTitle>
-      <div className="space-y-1.5 px-4 pb-5">
-        {TEMPLATES.map((t) => {
+      <SectionTitle>Bocetos, cajas y fijaciones</SectionTitle>
+      <div className="grid grid-cols-3 gap-1.5 px-4">
+        <button className={tile} title={SKETCH.description} onClick={() => {
+          addPart("sketch");
+          const id = useStore.getState().selectedId;
+          if (id) useSketchEditor.getState().open(id);
+        }}>
+          <PenTool size={20} strokeWidth={1.5} />
+          {SKETCH.name}
+        </button>
+        {FASTENERS.map((t) => {
           const Icon = iconFor(t.id);
           return (
-            <button key={t.id} onClick={() => addPart(t.id)} className="flex w-full items-start gap-2.5 rounded-xl border border-line bg-surface-2/40 p-2.5 text-left transition-colors hover:border-line-strong hover:bg-surface-2 cursor-pointer">
-              <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-surface-3 text-fg">
-                <Icon size={15} />
-              </div>
-              <div className="min-w-0">
-                <div className="text-[12.5px] font-medium text-fg">{t.name}</div>
-                <div className="line-clamp-2 text-[11.5px] text-muted">{t.description}</div>
-              </div>
+            <button key={t.id} className={tile} onClick={() => addPart(t.id)} title={t.description}>
+              <Icon size={20} strokeWidth={1.5} />
+              {t.name}
             </button>
           );
         })}
       </div>
+      <SectionTitle>Racks</SectionTitle>
+      <div className="grid grid-cols-3 gap-1.5 px-4">
+        {RACKS.map((t) => {
+          const Icon = iconFor(t.id);
+          return (
+            <button key={t.id} className={tile} onClick={() => addPart(t.id)} title={t.description}>
+              <Icon size={20} strokeWidth={1.5} />
+              {t.name}
+            </button>
+          );
+        })}
+      </div>
+      <details className="mx-4 mt-4 mb-3 rounded-xl border border-line bg-surface-2/20">
+        <summary className="cursor-pointer px-3 py-2.5 text-[11.5px] font-medium text-muted hover:text-fg">Biblioteca de ejemplos <span className="text-faint">({TEMPLATES.length})</span></summary>
+        <div className="space-y-1.5 px-2 pb-2">
+          {TEMPLATES.map((t) => {
+            const Icon = iconFor(t.id);
+            return (
+              <button key={t.id} onClick={() => addPart(t.id)} className="flex w-full items-start gap-2.5 rounded-xl border border-line bg-surface-2/40 p-2.5 text-left transition-colors hover:border-line-strong hover:bg-surface-2 cursor-pointer">
+                <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-surface-3 text-fg">
+                  <Icon size={15} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[12.5px] font-medium text-fg">{t.name}</div>
+                  <div className="line-clamp-2 text-[11.5px] text-muted">{t.description}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </details>
       <p className="px-4 pb-5 text-[11.5px] text-faint">
         Consejo: cualquier pieza puede ser <span className="text-err">agujero</span> (tecla H) para restar material de las demás.
       </p>
@@ -131,6 +182,7 @@ function SceneTab() {
             <Sparkles size={13} /> Con IA
           </Button>
         </div>
+        <div className="-mx-4 mt-4 text-left"><VariablesPanel /></div>
       </div>
     );
 
@@ -150,6 +202,7 @@ function SceneTab() {
               <span className="size-2.5 shrink-0 rounded-full" style={{ background: p.mode === "hole" ? "transparent" : p.color, border: p.mode === "hole" ? "1.5px dashed var(--err)" : "none" }} />
               <Icon size={14} className="shrink-0" />
               <span className="min-w-0 flex-1 truncate">{p.name}</span>
+              {p.body && p.mode === "solid" && <span className="max-w-20 truncate text-[10.5px] text-faint">{p.body}</span>}
               {p.mode === "hole" && <Pill tone="err">Agujero</Pill>}
               {(p.estimated?.length ?? 0) > 0 && <span className="size-1.5 rounded-full bg-warn" title="Medidas por confirmar" />}
               <button
@@ -166,6 +219,8 @@ function SceneTab() {
           );
         })}
       </div>
+      <VariablesPanel />
+      <div className="pb-5" />
     </>
   );
 }

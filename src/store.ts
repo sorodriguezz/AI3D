@@ -3,13 +3,17 @@ import { persist } from "zustand/middleware";
 import { heuristicAgent, runAgent, type AgentResult, type Proposal } from "./ai/agent";
 import { imageForModel } from "./ai/image";
 import { cliStatus, listModels, type AiSettings, type CliId, type CliInfo, type ProviderId } from "./ai/llm";
-import type { MeshPayload } from "./cad/client";
-import { getTemplate } from "./cad/templates";
+import { cancelCad, type MeshPayload } from "./cad/client";
+import { importPreviewScale } from "./cad/importScale";
+import { enclosureOuter, getTemplate } from "./cad/templates";
 import type { Design, Part, ParamValue } from "./cad/types";
 import { newDesign, newPart, uniqueName } from "./studio/parts";
+import { evaluateParam, resolveParts, type ParamErrors } from "./studio/params";
+import { resolveVariables, type Variable } from "./cad/expr";
 import * as ws from "./studio/workspace";
 import { loadAsset, prepareImport } from "./studio/assets";
-import { cachedMesh } from "./studio/meshes";
+import { cachedPartMesh } from "./studio/meshes";
+import { worldBounds } from "./studio/modeling";
 import { confirmDialog } from "./lib/platform";
 
 export interface Settings extends AiSettings {
@@ -39,8 +43,10 @@ interface State {
   doc: Design | null;
   docPath: string | null;
   saveState: SaveState;
-  past: Part[][];
-  future: Part[][];
+  past: Snapshot[];
+  future: Snapshot[];
+  /** Errores de fórmulas y bocetos por pieza y medida. */
+  paramErrors: ParamErrors;
   selectedId: string | null;
   focusParam: string | null;
   leftTab: LeftTab;
@@ -51,6 +57,8 @@ interface State {
   result: MeshPayload | null;
   building: boolean;
   buildError: string | null;
+  /** Cambia para volver a combinar la escena sin editarla. */
+  buildNonce: number;
 
   photo: string | null;
   mark: { x: number; y: number } | null;
@@ -90,6 +98,10 @@ interface State {
   importing: boolean;
   updatePart: (id: string, patch: Partial<Part>, history?: boolean) => void;
   setPartParam: (id: string, key: string, value: ParamValue) => void;
+  /** Define una medida por fórmula (null la vuelve a un valor fijo). Devuelve el error, si lo hay. */
+  setPartExpr: (id: string, key: string, expr: string | null) => string | null;
+  /** Cambia las variables (y, al renombrar una, las piezas que la usan) en un solo paso deshacible. */
+  setVariables: (variables: Variable[], parts?: Part[]) => void;
   confirmParam: (id: string, key: string) => void;
   beginChange: () => void;
   removePart: (id: string) => void;
@@ -104,6 +116,10 @@ interface State {
   setShowResult: (v: boolean) => void;
   setResult: (r: MeshPayload | null, error?: string | null) => void;
   setBuilding: (b: boolean) => void;
+  retryBuild: () => void;
+  cancelBuild: () => void;
+  /** Añade piezas ya construidas (herramientas de modelado) y selecciona la última. */
+  addParts: (parts: Part[]) => void;
   saveNow: () => Promise<void>;
 
   // IA
@@ -113,6 +129,12 @@ interface State {
   analyze: () => Promise<void>;
   cancelAnalyze: () => void;
   applyProposal: (p: Proposal) => void;
+}
+
+/** Estado que se deshace y rehace: piezas y variables. */
+export interface Snapshot {
+  parts: Part[];
+  variables?: Variable[];
 }
 
 let analyzeAbort: AbortController | null = null;
@@ -131,13 +153,21 @@ export const useStore = create<State>()(
         saveTimer = setTimeout(() => void get().saveNow(), 800);
       };
 
-      /** Cambia las piezas del documento registrando la versión anterior para deshacer. */
-      const commit = (parts: Part[], history = true) => {
+      const snapshot = (doc: Design): Snapshot => ({ parts: doc.parts, variables: doc.variables });
+
+      /**
+       * Cambia las piezas (y opcionalmente las variables) registrando la versión anterior para deshacer.
+       * Las medidas con fórmula y los bocetos acotados se recalculan siempre con las variables vigentes.
+       */
+      const commit = (parts: Part[], history = true, variables?: Variable[]) => {
         const { doc, past } = get();
         if (!doc) return;
+        const vars = variables ?? doc.variables;
+        const resolved = resolveParts(parts, vars);
         set({
-          doc: { ...doc, parts },
-          ...(history ? { past: [...past, doc.parts].slice(-HISTORY_LIMIT), future: [] } : {}),
+          doc: { ...doc, parts: resolved.parts, ...(variables ? { variables } : {}) },
+          paramErrors: resolved.errors,
+          ...(history ? { past: [...past, snapshot(doc)].slice(-HISTORY_LIMIT), future: [] } : {}),
         });
         scheduleSave();
       };
@@ -181,6 +211,7 @@ export const useStore = create<State>()(
         saveState: "saved",
         past: [],
         future: [],
+        paramErrors: {},
         selectedId: null,
         focusParam: null,
         leftTab: "insert",
@@ -194,6 +225,7 @@ export const useStore = create<State>()(
         result: null,
         building: false,
         buildError: null,
+        buildNonce: 0,
 
         photo: null,
         mark: null,
@@ -254,6 +286,7 @@ export const useStore = create<State>()(
             saveState: "saved",
             past: [],
             future: [],
+            paramErrors: {},
             selectedId: null,
             result: null,
             buildError: null,
@@ -268,7 +301,7 @@ export const useStore = create<State>()(
         openDesign: async (path) => {
           const doc = await ws.readDesign(path);
           for (const [id, a] of Object.entries(doc.assets ?? {})) void loadAsset(id, a).catch(() => undefined);
-          set({ view: "studio", doc, docPath: path, saveState: "saved", past: [], future: [], selectedId: null, result: null, buildError: null, leftTab: doc.parts.length ? "scene" : "insert", agent: null, activeProposal: null, prompt: doc.prompt ?? "", photo: null, mark: null });
+          set({ view: "studio", doc, docPath: path, saveState: "saved", past: [], future: [], paramErrors: resolveParts(doc.parts, doc.variables).errors, selectedId: null, result: null, buildError: null, leftTab: doc.parts.length ? "scene" : "insert", agent: null, activeProposal: null, prompt: doc.prompt ?? "", photo: null, mark: null });
         },
         renameEntry: (e, name) =>
           guard(async () => {
@@ -310,6 +343,26 @@ export const useStore = create<State>()(
           const t = getTemplate(type)!;
           // Las piezas nuevas se colocan junto a las existentes para no quedar superpuestas.
           const offset = doc.parts.length ? Math.min(120, 10 + doc.parts.length * 8) : 0;
+          if (t.pieces) {
+            // Plantillas de varias piezas (caja y tapa): comparten medidas y van en cuerpos distintos.
+            const link = crypto.randomUUID();
+            const first = newPart(type);
+            const gap = enclosureOuter(first.params).length + 10;
+            const created: Part[] = [];
+            t.pieces.items.forEach((item, i) => {
+              created.push(newPart(type, {
+                name: uniqueName([...doc.parts, ...created], item.name),
+                params: { ...first.params, [t.pieces!.param]: item.value },
+                estimated: first.estimated,
+                position: [offset + i * gap, 0, 0],
+                body: uniqueBody(doc.parts, item.body),
+                link,
+              }));
+            });
+            commit([...doc.parts, ...created]);
+            set({ selectedId: created[0].id });
+            return;
+          }
           const part = newPart(type, { name: uniqueName(doc.parts, t.name), position: [offset, 0, 0] });
           commit([...doc.parts, part]);
           set({ selectedId: part.id, leftTab: get().leftTab === "insert" ? "insert" : get().leftTab });
@@ -338,11 +391,51 @@ export const useStore = create<State>()(
           set({ importing: false, importError: errors.length ? errors.join("\n") : null });
         },
         updatePart: (id, patch, history = true) => commit(mapPart(id, (p) => ({ ...p, ...patch })), history),
-        setPartParam: (id, key, value) => commit(mapPart(id, (p) => ({ ...p, params: { ...p.params, [key]: value }, estimated: p.estimated?.filter((k) => k !== key) }))),
-        confirmParam: (id, key) => commit(mapPart(id, (p) => ({ ...p, estimated: p.estimated?.filter((k) => k !== key) }))),
+        setPartParam: (id, key, value) => {
+          const source = get().doc?.parts.find((p) => p.id === id);
+          const pieceParam = source && getTemplate(source.type)?.pieces?.param;
+          // Las piezas enlazadas comparten todas las medidas salvo la que las distingue.
+          const linked = (p: Part) => p.id === id || (!!source?.link && p.link === source.link && key !== pieceParam);
+          // Un valor escrito a mano reemplaza la fórmula de esa medida.
+          const withoutExpr = (p: Part) => {
+            if (!p.exprs?.[key]) return p.exprs;
+            const { [key]: _removed, ...rest } = p.exprs;
+            return Object.keys(rest).length ? rest : undefined;
+          };
+          commit(get().doc?.parts.map((p) => (linked(p) ? { ...p, params: { ...p.params, [key]: value }, exprs: withoutExpr(p), estimated: p.estimated?.filter((k) => k !== key) } : p)) ?? []);
+        },
+        setPartExpr: (id, key, expr) => {
+          const doc = get().doc;
+          const source = doc?.parts.find((p) => p.id === id);
+          if (!doc || !source) return null;
+          const linked = (p: Part) => p.id === id || (!!source.link && p.link === source.link);
+          if (expr === null || !expr.trim()) {
+            commit(doc.parts.map((p) => {
+              if (!linked(p) || !p.exprs?.[key]) return p;
+              const { [key]: _removed, ...rest } = p.exprs;
+              return { ...p, exprs: Object.keys(rest).length ? rest : undefined };
+            }));
+            return null;
+          }
+          try {
+            const value = evaluateParam(source, key, expr, resolveVariables(doc.variables).values);
+            commit(doc.parts.map((p) => (linked(p) ? { ...p, params: { ...p.params, [key]: value }, exprs: { ...p.exprs, [key]: expr.trim() }, estimated: p.estimated?.filter((k) => k !== key) } : p)));
+            return null;
+          } catch (e) {
+            return e instanceof Error ? e.message : String(e);
+          }
+        },
+        setVariables: (variables, parts) => {
+          const doc = get().doc;
+          if (doc) commit(parts ?? doc.parts, true, variables);
+        },
+        confirmParam: (id, key) => {
+          const link = get().doc?.parts.find((p) => p.id === id)?.link;
+          commit(get().doc?.parts.map((p) => (p.id === id || (link && p.link === link) ? { ...p, estimated: p.estimated?.filter((k) => k !== key) } : p)) ?? []);
+        },
         beginChange: () => {
           const { doc, past } = get();
-          if (doc) set({ past: [...past, doc.parts].slice(-HISTORY_LIMIT), future: [] });
+          if (doc) set({ past: [...past, { parts: doc.parts, variables: doc.variables }].slice(-HISTORY_LIMIT), future: [] });
         },
         removePart: (id) => {
           commit(get().doc?.parts.filter((p) => p.id !== id) ?? []);
@@ -356,17 +449,23 @@ export const useStore = create<State>()(
           commit([...doc.parts, copy]);
           set({ selectedId: copy.id });
         },
-        dropToBed: (id) => commit(mapPart(id, (p) => ({ ...p, position: [p.position[0], p.position[1], 0] }))),
+        dropToBed: (id) => commit(mapPart(id, (p) => {
+          const mesh = cachedPartMesh(p);
+          const bottom = mesh ? worldBounds(p, mesh).min[2] : p.position[2];
+          return { ...p, position: [p.position[0], p.position[1], p.position[2] - bottom] };
+        })),
         undo: () => {
           const { doc, past, future } = get();
           if (!doc || past.length === 0) return;
-          set({ doc: { ...doc, parts: past[past.length - 1] }, past: past.slice(0, -1), future: [doc.parts, ...future] });
+          const prev = past[past.length - 1];
+          set({ doc: { ...doc, parts: prev.parts, variables: prev.variables }, paramErrors: resolveParts(prev.parts, prev.variables).errors, past: past.slice(0, -1), future: [{ parts: doc.parts, variables: doc.variables }, ...future] });
           scheduleSave();
         },
         redo: () => {
           const { doc, past, future } = get();
           if (!doc || future.length === 0) return;
-          set({ doc: { ...doc, parts: future[0] }, past: [...past, doc.parts], future: future.slice(1) });
+          const next = future[0];
+          set({ doc: { ...doc, parts: next.parts, variables: next.variables }, paramErrors: resolveParts(next.parts, next.variables).errors, past: [...past, { parts: doc.parts, variables: doc.variables }], future: future.slice(1) });
           scheduleSave();
         },
         select: (selectedId, focusParam = null) => set({ selectedId, focusParam }),
@@ -376,6 +475,14 @@ export const useStore = create<State>()(
         setShowResult: (showResult) => set({ showResult }),
         setResult: (result, error = null) => set({ result, buildError: error }),
         setBuilding: (building) => set({ building }),
+        retryBuild: () => set({ buildNonce: get().buildNonce + 1, buildError: null }),
+        cancelBuild: () => cancelCad(),
+        addParts: (parts) => {
+          const doc = get().doc;
+          if (!doc || !parts.length) return;
+          commit([...doc.parts, ...parts]);
+          set({ selectedId: parts[parts.length - 1].id });
+        },
         saveNow: async () => {
           if (saveTimer) clearTimeout(saveTimer);
           const { doc, docPath, prompt } = get();
@@ -383,7 +490,7 @@ export const useStore = create<State>()(
           set({ saveState: "saving" });
           const thumbnail = thumbnailHook.capture?.() ?? doc.thumbnail;
           // Solo se guardan los modelos importados que aún usa alguna pieza (incluido el historial de deshacer).
-          const used = new Set([doc.parts, ...get().past, ...get().future].flat().map((p) => String(p.params.asset ?? "")));
+          const used = new Set([doc.parts, ...get().past.map((h) => h.parts), ...get().future.map((h) => h.parts)].flat().map((p) => String(p.params.asset ?? "")));
           const assets = Object.fromEntries(Object.entries(doc.assets ?? {}).filter(([id]) => used.has(id)));
           const next: Design = { ...doc, assets, prompt, updatedAt: Date.now(), thumbnail: thumbnail ?? undefined };
           try {
@@ -406,8 +513,8 @@ export const useStore = create<State>()(
           const current = doc?.parts ?? [];
           const sizes: Record<string, number[]> = {};
           for (const p of current) {
-            const m = p.type === "imported" ? cachedMesh(p.type, p.params) : undefined;
-            if (m) sizes[p.name] = m.bbox.max.map((v, i) => +(v - m.bbox.min[i]).toFixed(1));
+            const m = p.type === "imported" ? cachedPartMesh(p) : undefined;
+            if (m) sizes[p.name] = m.bbox.max.map((v, i) => +((v - m.bbox.min[i]) * (p.features?.length ? 1 : importPreviewScale(p.type, p.params))).toFixed(1));
           }
           try {
             let result: AgentResult;
@@ -457,6 +564,13 @@ export const useStore = create<State>()(
     },
   ),
 );
+
+/** Nombre de cuerpo libre: «Tapa», «Tapa 2», … */
+export function uniqueBody(parts: Part[], base: string): string {
+  const used = new Set(parts.map((p) => p.body).filter(Boolean));
+  if (!used.has(base)) return base;
+  for (let i = 2; ; i++) if (!used.has(`${base} ${i}`)) return `${base} ${i}`;
+}
 
 /** Medidas sin verificar en toda la escena (visibles según cada plantilla). */
 export function pendingMeasurements(parts: Part[]) {

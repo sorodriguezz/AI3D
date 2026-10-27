@@ -1,5 +1,5 @@
-import { PRIMITIVES, SHAPES, TEMPLATES, getTemplate, sanitizeParams } from "../cad/templates";
-import type { ParamDef, Part, TemplateMeta, Vec3 } from "../cad/types";
+import { FASTENERS, PRIMITIVES, RACKS, SHAPES, TEMPLATES, getTemplate, sanitizeParams } from "../cad/templates";
+import type { MirrorAxes, ParamDef, Part, TemplateMeta, Vec3 } from "../cad/types";
 import { newPart } from "../studio/parts";
 import { complete, extractJson, type AiSettings } from "./llm";
 
@@ -53,6 +53,7 @@ Convenciones:
 - Unidades en milímetros. Z hacia arriba. La cama de impresión es el plano Z = 0.
 - El origen de cada pieza es el centro de su base. "position" [x,y,z] coloca ese origen.
 - "rotation" [rx,ry,rz] en grados, aplicada sobre el origen de la pieza: primero X, luego Y, luego Z.
+- "mirror" [boolean,boolean,boolean] refleja sobre los ejes locales X, Y, Z antes de rotar. Conserva los espejos existentes salvo que el usuario pida cambiarlos.
 - "mode": "solid" suma material; "hole" resta material de todas las piezas sólidas (agujeros, ranuras, rebajes).
 - El resultado final es la unión de los sólidos menos la unión de los agujeros. Haz que los sólidos se solapen al menos 0,5 mm para que queden unidos.
 - Para agujeros pasantes, haz la pieza hueca 1–2 mm más larga que el material que atraviesa.
@@ -60,6 +61,12 @@ Convenciones:
 
 Catálogo — formas básicas:
 ${PRIMITIVES.map(describeShape).join("\n")}
+
+Catálogo — cajas y fijaciones ("screw-hole" y "vent" van con "mode": "hole"; su cara de entrada queda a la altura "depth" sobre su origen, y "+1" si son pasantes):
+${FASTENERS.map(describeShape).join("\n")}
+
+Catálogo — racks (patrón de agujeros EIA-310 ya verificado; "cable-pass" va con "mode": "hole"):
+${RACKS.map(describeShape).join("\n")}
 
 Catálogo — componentes paramétricos (piezas completas ya resueltas):
 ${TEMPLATES.map(describeShape).join("\n")}
@@ -120,7 +127,9 @@ function scenePartsFromModel(raw: unknown, estimated: string[], current: Part[])
       position: vec(r.position, 2000),
       rotation: vec(r.rotation, 360),
       mode: r.mode === "hole" ? "hole" : "solid",
-      ...(prev ? { id: prev.id, color: prev.color } : {}),
+      mirror: Array.isArray(r.mirror) && r.mirror.length === 3 && r.mirror.every((v) => typeof v === "boolean") ? r.mirror as MirrorAxes : prev?.mirror,
+      // Operaciones, cuerpos y enlaces no los edita la IA: se conservan.
+      ...(prev ? { id: prev.id, color: prev.color, features: prev.features, body: prev.body, cutBodies: prev.cutBodies, link: prev.link } : {}),
     });
     const keys = new Set(t.params.map((d) => d.key));
     const fromAi = estimated.filter((e) => e.startsWith(name + ".")).map((e) => e.slice(name.length + 1)).filter((k) => keys.has(k));
@@ -149,10 +158,10 @@ export function sanitizeResult(raw: unknown, current: Part[]): AgentResult {
 
 function sceneForPrompt(parts: Part[], sizes?: Record<string, number[]>): string {
   if (parts.length === 0) return "La escena actual está vacía.";
-  const slim = parts.map(({ name, type, params, position, rotation, mode }) => {
-    if (type !== "imported") return { name, type, params, position, rotation, mode };
+  const slim = parts.map(({ name, type, params, position, rotation, mirror, mode }) => {
+    if (type !== "imported") return { name, type, params, position, rotation, mirror, mode };
     const { asset: _a, format: _f, ...visible } = params;
-    return { name, type, params: visible, position, rotation, mode, ...(sizes?.[name] ? { size: sizes[name] } : {}) };
+    return { name, type, params: visible, position, rotation, mirror, mode, ...(sizes?.[name] ? { size: sizes[name] } : {}) };
   });
   return "Escena actual:\n" + JSON.stringify(slim);
 }

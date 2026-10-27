@@ -1,29 +1,80 @@
 name: release
 
-# Sube una etiqueta como v0.2.0 (ver scripts/bump_version.py) para compilar, firmar y publicar.
+# Al subir una versión nueva a main se crea su tag y se compila, firma y publica.
 # La Release empieza como borrador; cada plataforma sube su instalador y su paquete de
 # actualización. Solo cuando están las tres se publica, así releases/latest/download/latest.json
 # (lo que lee el actualizador de la app) nunca apunta a una versión sin el sistema del usuario.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# One publication at a time; never cancel an installer build in progress.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Test release automation
+        run: python3 -m unittest discover -s scripts -p test_release.py -v
+      - name: Validate version and create its tag
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATER_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: python3 scripts/prepare_release.py
+
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install webkit
+      - run: npm test
+
   create-release:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     outputs:
       id: ${{ steps.draft.outputs.id }}
+      tag: ${{ needs.prepare.outputs.tag }}
+      sha: ${{ needs.prepare.outputs.sha }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       # El id sale directamente de la creación; listar releases justo después puede no encontrarla.
       - id: draft
         run: |
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.tag_name == env.TAG) | .id')
+          if [ -n "$existing" ]; then
+            echo "id=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
           body=$(printf '%s\n' \
             "## Descargar AI3D $TAG" \
@@ -57,6 +108,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -81,15 +134,21 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.id }}
           includeUpdaterJson: true
 
+      - name: Verify macOS app signature before publishing the release
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict --verbose=2 "src-tauri/target/${{ matrix.target }}/release/bundle/macos/AI3D.app"
+
   publish-release:
     needs: [create-release, publish]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.create-release.outputs.tag }}
       ID: ${{ needs.create-release.outputs.id }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.sha }}
       # Un borrador no se puede buscar por etiqueta, así que todo va por su id.
       - name: Rebuild latest.json from the signed bundles
         run: |
@@ -117,6 +176,9 @@ jobs:
             [ -n "$line" ] || { echo "falta un instalador que coincida con $pattern"; exit 1; }
             aid=${line%% *}
             gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > "$stable"
+            old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --paginate \
+              --jq '.[] | [.id, .name] | @tsv' | awk -v name="$stable" '$2 == name {print $1}')
+            [ -z "$old" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
             gh api -X POST -H "Content-Type: application/octet-stream" --input "$stable" \
               "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=$stable" > /dev/null
             echo "$stable <- ${line#* }"

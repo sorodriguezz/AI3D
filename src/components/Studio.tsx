@@ -8,6 +8,7 @@ import { useStore } from "../store";
 import { Inspector } from "./Inspector";
 import { LeftPanel } from "./LeftPanel";
 import { StudioViewport } from "./StudioViewport";
+import { SketchEditor } from "./SketchEditor";
 import { IconButton, InlineEdit, Logo, cx } from "./ui";
 
 function SaveIndicator() {
@@ -97,6 +98,7 @@ export function Studio() {
         <StudioViewport />
         <Inspector />
       </main>
+      <SketchEditor />
     </div>
   );
 }

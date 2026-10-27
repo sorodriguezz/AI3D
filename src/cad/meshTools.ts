@@ -3,13 +3,21 @@ import type { MeshShape } from "replicad";
 // Utilidades para mallas de Manifold. Se leen directamente de Manifold: la conversión de replicad
 // (`MeshShape.mesh()`) recalcula normales y tarda decenas de segundos con modelos grandes.
 
-/** Malla de Manifold lista para Three.js: triángulos planos y aristas marcadas (> 30°). */
+/** Malla indexada de Manifold para Three.js, con aristas marcadas (> 30°). */
 export function manifoldMesh(shape: MeshShape) {
   const g = (shape as unknown as { wrapped: { getMesh(): { numProp: number; vertProperties: Float32Array; triVerts: Uint32Array } } }).wrapped.getMesh();
   const P = g.vertProperties, np = g.numProp, T = g.triVerts;
   const n = T.length / 3;
-  const vertices = new Float32Array(n * 9);
-  const normals = new Float32Array(n * 9);
+  const nv = P.length / np;
+  // Keep shared vertices instead of expanding a million triangles into three
+  // million vertices. The material uses flat shading to retain sharp faces.
+  const vertices = new Float32Array(nv * 3);
+  const normals = new Float32Array(nv * 3);
+  for (let i = 0; i < nv; i++) {
+    vertices[i * 3] = P[i * np];
+    vertices[i * 3 + 1] = P[i * np + 1];
+    vertices[i * 3 + 2] = P[i * np + 2];
+  }
   const faceN = new Float32Array(n * 3);
   for (let t = 0; t < n; t++) {
     const ia = T[t * 3] * np, ib = T[t * 3 + 1] * np, ic = T[t * 3 + 2] * np;
@@ -19,13 +27,24 @@ export function manifoldMesh(shape: MeshShape) {
     nx /= l;
     ny /= l;
     nz /= l;
-    faceN.set([nx, ny, nz], t * 3);
-    vertices.set([ax, ay, az, bx, by, bz, cx, cy, cz], t * 9);
-    for (let k = 0; k < 3; k++) normals.set([nx, ny, nz], t * 9 + k * 3);
+    faceN[t * 3] = nx;
+    faceN[t * 3 + 1] = ny;
+    faceN[t * 3 + 2] = nz;
+    for (let k = 0; k < 3; k++) {
+      const offset = T[t * 3 + k] * 3;
+      normals[offset] += nx;
+      normals[offset + 1] += ny;
+      normals[offset + 2] += nz;
+    }
+  }
+  for (let i = 0; i < normals.length; i += 3) {
+    const length = Math.hypot(normals[i], normals[i + 1], normals[i + 2]) || 1;
+    normals[i] /= length;
+    normals[i + 1] /= length;
+    normals[i + 2] /= length;
   }
   // Aristas: lados compartidos por dos triángulos con un ángulo marcado, o bordes abiertos.
   const firstFace = new Map<number, number>();
-  const nv = P.length / np;
   const lines: number[] = [];
   const pushEdge = (u: number, v: number) => lines.push(P[u * np], P[u * np + 1], P[u * np + 2], P[v * np], P[v * np + 1], P[v * np + 2]);
   for (let t = 0; t < n; t++) {
@@ -41,7 +60,7 @@ export function manifoldMesh(shape: MeshShape) {
       }
     }
   }
-  return { vertices, normals, triangles: Uint32Array.from({ length: n * 3 }, (_, i) => i), edges: new Float32Array(lines), indexed: { P, np, T } };
+  return { vertices, normals, triangles: T.slice(), edges: new Float32Array(lines), indexed: { P, np, T } };
 }
 
 

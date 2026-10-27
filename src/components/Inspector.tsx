@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, CheckCircle2, Download, Info, Minus, Plus, Printer, XCircle } from "lucide-react";
+import { AlertTriangle, Check, CheckCircle2, Download, Eye, EyeOff, Info, Layers, Minus, PenTool, Plus, Printer, X, XCircle } from "lucide-react";
 import { exportModel } from "../cad/client";
 import { getTemplate } from "../cad/templates";
-import type { Check as CheckItem, ExportFormat, NumberParam, ParamDef, Part } from "../cad/types";
+import { MAIN_BODY, type Check as CheckItem, type ExportFormat, type Feature, type NumberParam, type ParamDef, type Part } from "../cad/types";
+import { bodiesOf, bodyColors, toScene } from "../studio/parts";
 import { saveFile } from "../lib/platform";
-import { PART_COLORS } from "../studio/parts";
 import { pendingMeasurements, useStore } from "../store";
 import { iconFor } from "./LeftPanel";
 import { InlineEdit, Pill, SectionTitle, cx } from "./ui";
+import { PartColorPicker } from "./PartColorPicker";
+import { useSketchEditor } from "./SketchEditor";
 
 // ---------------------------------------------------------------- Controles
 
@@ -89,6 +91,10 @@ function ParamRow({ part, def }: { part: Part; def: ParamDef }) {
   const ref = useRef<HTMLDivElement>(null);
   const [flash, setFlash] = useState(false);
   const pending = part.estimated?.includes(def.key);
+  const numeric = def.type === "number" || def.type === "int";
+  const expr = part.exprs?.[def.key];
+  const [editing, setEditing] = useState(false);
+  const formula = numeric && (expr !== undefined || editing);
 
   useEffect(() => {
     if (focusParam !== def.key) return;
@@ -103,7 +109,20 @@ function ParamRow({ part, def }: { part: Part; def: ParamDef }) {
   return (
     <div ref={ref} className={cx("rounded-lg px-4 py-2 transition-colors", flash && "bg-accent-soft")}>
       <div className="mb-1.5 flex items-center justify-between gap-2">
-        <span className="text-[12px] text-fg">{def.label}</span>
+        <span className="flex items-center gap-1.5 text-[12px] text-fg">
+          {def.label}
+          {numeric && (
+            <button
+              aria-label={`Fórmula para ${def.label}`}
+              aria-pressed={formula}
+              title={formula ? "Volver a un valor fijo" : "Definir con una fórmula (variables del diseño)"}
+              onClick={() => (formula ? (useStore.getState().setPartExpr(part.id, def.key, null), setEditing(false)) : setEditing(true))}
+              className={cx("rounded px-1 font-mono text-[10px] italic cursor-pointer", formula ? "bg-accent-soft text-accent-text" : "text-faint hover:text-fg")}
+            >
+              fx
+            </button>
+          )}
+        </span>
         {pending ? (
           <button onClick={() => confirm(part.id, def.key)} className="cursor-pointer" title="Marcar como medida verificada">
             <Pill tone="warn" className="hover:brightness-125">Por medir · confirmar</Pill>
@@ -114,8 +133,43 @@ function ParamRow({ part, def }: { part: Part; def: ParamDef }) {
           </Pill>
         ) : null}
       </div>
-      <ParamControl part={part} def={def} />
+      {formula ? <FormulaField part={part} def={def} onDone={() => setEditing(false)} /> : <ParamControl part={part} def={def} />}
       {def.hint && <p className="mt-1 text-[11px] text-faint">{def.hint}</p>}
+    </div>
+  );
+}
+
+/** Fórmula de una medida: se aplica al pulsar Intro o al salir del campo. */
+function FormulaField({ part, def, onDone }: { part: Part; def: ParamDef; onDone: () => void }) {
+  const setExpr = useStore((s) => s.setPartExpr);
+  const stored = useStore((s) => s.paramErrors[part.id]?.[def.key]);
+  const saved = part.exprs?.[def.key] ?? "";
+  const [draft, setDraft] = useState(saved || String(part.params[def.key]));
+  const [error, setError] = useState<string | null>(null);
+  const apply = () => {
+    if (draft.trim() === saved) return;
+    const message = setExpr(part.id, def.key, draft);
+    setError(message);
+    if (!message && !draft.trim()) onDone();
+  };
+  const unit = "unit" in def ? def.unit : "";
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <input
+          aria-label={`Fórmula de ${def.label}`}
+          autoFocus={!saved}
+          spellCheck={false}
+          className="h-7 min-w-0 flex-1 rounded-md border border-line bg-surface-2 px-2 font-mono text-[12px] text-fg outline-none focus:border-line-strong"
+          value={draft}
+          placeholder="ancho - 2 * pared"
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={apply}
+          onKeyDown={(e) => e.key === "Enter" && apply()}
+        />
+        <span className="shrink-0 font-mono text-[11.5px] text-muted">= {+Number(part.params[def.key]).toFixed(3)}{unit ? ` ${unit}` : ""}</span>
+      </div>
+      {(error ?? stored) && <p role="alert" className="mt-1 text-[11px] text-err">{error ?? stored}</p>}
     </div>
   );
 }
@@ -167,6 +221,7 @@ function ImportedInfo({ part }: { part: Part }) {
 
 function PartInspector({ part }: { part: Part }) {
   const update = useStore((s) => s.updatePart);
+  const sketchErrors = useStore((s) => s.paramErrors[part.id]);
   const t = getTemplate(part.type);
   const Icon = iconFor(part.type);
   if (!t) return <div className="p-4 text-err">Forma desconocida: {part.type}</div>;
@@ -196,15 +251,19 @@ function PartInspector({ part }: { part: Part }) {
           </button>
         ))}
       </div>
-      {part.mode === "solid" && (
-        <div className="mt-2 flex gap-1.5 px-4">
-          {PART_COLORS.map((c) => (
-            <button key={c} aria-label={`Color ${c}`} onClick={() => update(part.id, { color: c })} className={cx("size-5 rounded-full border-2 cursor-pointer", part.color === c ? "border-fg" : "border-transparent")} style={{ background: c }} />
-          ))}
-        </div>
-      )}
+      {part.mode === "solid" && <PartColorPicker part={part} />}
+      <BodyControl part={part} />
 
       {part.type === "imported" && <ImportedInfo part={part} />}
+      {part.type === "sketch" && (
+        <div className="mx-4 mt-3">
+          <button onClick={() => useSketchEditor.getState().open(part.id)} className="flex h-9 w-full items-center justify-center gap-1.5 rounded-lg border border-accent/50 bg-accent-soft text-[12.5px] font-medium text-fg hover:brightness-105 cursor-pointer">
+            <PenTool size={13} /> Editar boceto
+          </button>
+          {Object.entries(sketchErrors ?? {}).filter(([k]) => k === "profile" || k.startsWith("cota")).map(([k, v]) => <p key={k} role="alert" className="mt-1 text-[11px] text-err">{v}</p>)}
+        </div>
+      )}
+      <FeatureList part={part} />
 
       <SectionTitle>Transformación</SectionTitle>
       <VecRow label="Posición" unit="mm" value={part.position} onChange={(position) => update(part.id, { position })} />
@@ -228,6 +287,108 @@ function PartInspector({ part }: { part: Part }) {
       )}
     </>
   );
+}
+
+// ---------------------------------------------------------------- Cuerpos y operaciones
+
+const featureLabel = (f: Feature) =>
+  f.kind === "shell" ? "Vaciado"
+  : f.kind === "trim" ? "División por plano"
+  : `${f.kind === "fillet" ? "Redondeo" : "Chaflán"} · ${f.edges.length} ${f.edges.length === 1 ? "arista" : "aristas"}`;
+
+/** Cuerpo de una pieza sólida, o cuerpos que recorta un agujero. */
+function BodyControl({ part }: { part: Part }) {
+  const parts = useStore((s) => s.doc?.parts ?? []);
+  const update = useStore((s) => s.updatePart);
+  const bodies = bodiesOf(parts);
+  const [draft, setDraft] = useState("");
+  const field = "h-7 min-w-0 flex-1 rounded-md border border-line bg-surface-2 px-2 text-[12px] text-fg outline-none";
+  if (part.mode === "hole") {
+    const all = !part.cutBodies;
+    const toggle = (b: string) => {
+      const current = part.cutBodies ?? bodies;
+      const next = current.includes(b) ? current.filter((x) => x !== b) : [...current, b];
+      update(part.id, { cutBodies: next.length === bodies.length && bodies.every((x) => next.includes(x)) ? undefined : next });
+    };
+    return (
+      <div className="mx-4 mt-3 space-y-1.5 text-[11.5px] text-muted">
+        <div className="flex items-center gap-1.5"><Layers size={12} /> Recorta a</div>
+        <div className="flex flex-wrap gap-1">
+          {bodies.map((b) => {
+            const on = all || part.cutBodies!.includes(b);
+            return <button key={b} aria-pressed={on} onClick={() => toggle(b)} className={cx("rounded-md border px-2 py-0.5 cursor-pointer", on ? "border-err/40 bg-err/10 text-err" : "border-line text-faint")}>{b}</button>;
+          })}
+        </div>
+      </div>
+    );
+  }
+  const current = part.body || MAIN_BODY;
+  return (
+    <div className="mx-4 mt-3 flex items-center gap-1.5 text-[11.5px] text-muted">
+      <Layers size={12} className="shrink-0" />
+      <select aria-label="Cuerpo" className={field} value={current} onChange={(e) => (e.target.value === "__new" ? setDraft(" ") : update(part.id, { body: e.target.value === MAIN_BODY ? undefined : e.target.value }))}>
+        {[...new Set([current, ...bodies])].map((b) => <option key={b} value={b}>{b}</option>)}
+        <option value="__new">Nuevo cuerpo…</option>
+      </select>
+      {draft && (
+        <input autoFocus aria-label="Nombre del cuerpo nuevo" className={field} placeholder="Nombre" value={draft.trim()} onChange={(e) => setDraft(e.target.value || " ")}
+          onKeyDown={(e) => { if (e.key === "Enter" && draft.trim()) { update(part.id, { body: draft.trim() }); setDraft(""); } else if (e.key === "Escape") setDraft(""); }}
+          onBlur={() => { if (draft.trim()) update(part.id, { body: draft.trim() }); setDraft(""); }} />
+      )}
+    </div>
+  );
+}
+
+/** Historial de operaciones de la pieza: se puede cambiar cada valor, suprimir o quitar una operación. */
+function FeatureList({ part }: { part: Part }) {
+  const update = useStore((s) => s.updatePart);
+  if (!part.features?.length) return null;
+  const features = part.features;
+  const change = (i: number, patch: Partial<Feature>) => update(part.id, { features: features.map((f, j) => (j === i ? ({ ...f, ...patch } as Feature) : f)) });
+  const num = "h-6 w-16 rounded border border-line bg-surface-2 px-1.5 text-right font-mono text-[11.5px] text-fg outline-none focus:border-line-strong";
+  return (
+    <>
+      <SectionTitle>Operaciones</SectionTitle>
+      <div className="space-y-0.5 px-2">
+        {features.map((f, i) => (
+          <div key={i} className={cx("group rounded-lg px-2 py-1 text-[12px] text-fg hover:bg-surface-2", f.suppressed && "opacity-50")}>
+            <div className="flex items-center justify-between gap-2">
+              <span className={cx("min-w-0 truncate", f.suppressed && "line-through")}>{i + 1}. {featureLabel(f)}</span>
+              <span className="flex shrink-0 items-center gap-1.5">
+                <button aria-label={f.suppressed ? "Activar operación" : "Suprimir operación"} title={f.suppressed ? "Activar" : "Suprimir sin borrarla"} onClick={() => change(i, { suppressed: !f.suppressed || undefined })} className="text-faint hover:text-fg cursor-pointer">{f.suppressed ? <EyeOff size={12} /> : <Eye size={12} />}</button>
+                <button aria-label={`Quitar ${featureLabel(f)}`} onClick={() => update(part.id, { features: features.filter((_, j) => j !== i) })} className="text-faint hover:text-err cursor-pointer"><X size={12} /></button>
+              </span>
+            </div>
+            {f.kind !== "trim" && !f.suppressed && (
+              <div className="mt-1 flex items-center gap-2 text-[11px] text-muted">
+                <span>{f.kind === "shell" ? "Espesor" : f.kind === "fillet" ? "Radio" : "Distancia"}</span>
+                <FeatureNumber value={f.kind === "shell" ? f.thickness : f.size} className={num} onCommit={(v) => change(i, f.kind === "shell" ? { thickness: v } : { size: v })} />
+                <span>mm</span>
+                {f.kind === "shell" && (
+                  <select aria-label="Cara abierta" value={f.open} onChange={(e) => change(i, { open: e.target.value as "top" | "bottom" })} className="h-6 rounded border border-line bg-surface-2 px-1 text-[11px] text-fg">
+                    <option value="top">abierta arriba</option>
+                    <option value="bottom">abierta abajo</option>
+                  </select>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      <p className="px-4 pt-1 text-[10.5px] text-faint">Al cambiar un valor se recalculan las operaciones siguientes. Si alguna deja de encajar, el resultado muestra el error y puedes suprimirla.</p>
+    </>
+  );
+}
+
+function FeatureNumber({ value, className, onCommit }: { value: number; className: string; onCommit: (v: number) => void }) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const v = parseFloat(draft.replace(",", "."));
+    if (Number.isFinite(v) && v > 0 && v !== value) onCommit(v);
+    else setDraft(String(value));
+  };
+  return <input aria-label="Valor de la operación" className={className} value={draft} onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && commit()} />;
 }
 
 // ---------------------------------------------------------------- Diseño
@@ -269,6 +430,10 @@ function DesignInspector() {
   const renameDoc = useStore((s) => s.renameDoc);
   const [busy, setBusy] = useState<ExportFormat | null>(null);
   const [message, setMessage] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [body, setBody] = useState("");
+  const bodies = result?.bodies?.map((b) => b.name) ?? [];
+  const chosen = bodies.includes(body) ? body : "";
+  const exactChoice = chosen ? result?.bodies?.find((b) => b.name === chosen)?.exact : result?.exact;
   const checks = designChecks(doc.parts, result, buildVolume).sort((a, b) => ({ error: 0, warn: 1, ok: 2 })[a.level] - ({ error: 0, warn: 1, ok: 2 })[b.level]);
   const pending = pendingMeasurements(doc.parts);
 
@@ -276,8 +441,9 @@ function DesignInspector() {
     setBusy(f);
     setMessage(null);
     try {
-      const data = await exportModel(f, doc.name);
-      const path = await saveFile(data, `${doc.name}.${f}`, f.toUpperCase(), f);
+      const name = chosen ? `${doc.name} - ${chosen}` : doc.name;
+      const data = await exportModel(f, name, { parts: toScene(doc.parts), body: chosen || undefined, colors: bodyColors(doc.parts) });
+      const path = await saveFile(data, `${name}.${f}`, f.toUpperCase(), f);
       if (path) setMessage({ tone: "ok", text: `Exportado: ${path}` });
     } catch (e) {
       setMessage({ tone: "err", text: e instanceof Error ? e.message : String(e) });
@@ -328,12 +494,18 @@ function DesignInspector() {
 
       <SectionTitle>Exportar</SectionTitle>
       <div className="space-y-2 px-4 pb-5">
+        {bodies.length > 1 && (
+          <select aria-label="Cuerpo a exportar" value={chosen} onChange={(e) => setBody(e.target.value)} className="h-8 w-full rounded-md border border-line bg-surface-2 px-2 text-[12px] text-fg outline-none">
+            <option value="">Todos los cuerpos ({bodies.length})</option>
+            {bodies.map((b) => <option key={b} value={b}>Solo {b}</option>)}
+          </select>
+        )}
         <div className="grid grid-cols-3 gap-1.5">
           {FORMATS.map((f) => (
             <button
               key={f.id}
-              disabled={!result || building || busy !== null || (f.id === "step" && !result.exact)}
-              title={f.id === "step" && result && !result.exact ? "No disponible: la escena contiene un modelo de malla importado." : undefined}
+              disabled={!result || building || busy !== null || (f.id === "step" && !exactChoice)}
+              title={f.id === "step" && result && !exactChoice ? "No disponible: contiene un modelo de malla importado." : undefined}
               onClick={() => doExport(f.id)}
               className={cx("flex flex-col items-center gap-0.5 rounded-xl border py-2.5 transition-colors disabled:opacity-40 cursor-pointer", f.id === "3mf" ? "border-accent/50 bg-accent text-accent-ink hover:brightness-95" : "border-line bg-surface-2 text-fg hover:bg-surface-3")}
             >
@@ -344,7 +516,7 @@ function DesignInspector() {
             </button>
           ))}
         </div>
-        <p className="text-[11px] text-faint">Se exporta el resultado combinado: sólidos unidos menos agujeros. Las piezas ocultas no se incluyen.</p>
+        <p className="text-[11px] text-faint">Cada cuerpo se combina por separado (sólidos unidos menos sus agujeros) y en 3MF se guarda como un objeto con su color. Las piezas ocultas no se incluyen.</p>
         {message && <div className={cx("break-all rounded-lg px-3 py-2 text-[11.5px]", message.tone === "ok" ? "bg-ok/10 text-ok" : "bg-err/10 text-err")}>{message.text}</div>}
       </div>
     </>

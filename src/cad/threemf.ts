@@ -42,26 +42,44 @@ function weld(vertices: ArrayLike<number>, triangles: ArrayLike<number>) {
   return { verts: out, tris };
 }
 
-export function build3MF(vertices: ArrayLike<number>, triangles: ArrayLike<number>, name: string): Uint8Array {
-  const { verts, tris } = weld(vertices, triangles);
+export interface ModelObject {
+  name: string;
+  vertices: ArrayLike<number>;
+  triangles: ArrayLike<number>;
+  /** Color #rrggbb del objeto. */
+  color?: string;
+}
+
+/** Un objeto por cuerpo, con su nombre y color, para que el slicer los trate como piezas separadas. */
+export function build3MF(objects: ModelObject[], name: string): Uint8Array {
   const f = (v: number) => +v.toFixed(4);
-  const parts: string[] = [];
-  for (let i = 0; i < verts.length; i += 3) parts.push(`<vertex x="${f(verts[i])}" y="${f(verts[i + 1])}" z="${f(verts[i + 2])}"/>`);
-  const vXml = parts.join("");
-  parts.length = 0;
-  for (let i = 0; i < tris.length; i += 3) parts.push(`<triangle v1="${tris[i]}" v2="${tris[i + 1]}" v3="${tris[i + 2]}"/>`);
-  const tXml = parts.join("");
+  const colored = objects.some((o) => o.color);
+  const resources: string[] = [];
+  if (colored) {
+    const bases = objects.map((o) => `<base name="${escapeXml(o.name)}" displaycolor="${(o.color ?? "#cccccc").toUpperCase()}FF"/>`).join("");
+    resources.push(`<basematerials id="1">${bases}</basematerials>`);
+  }
+  objects.forEach((o, index) => {
+    const { verts, tris } = weld(o.vertices, o.triangles);
+    const parts: string[] = [];
+    for (let i = 0; i < verts.length; i += 3) parts.push(`<vertex x="${f(verts[i])}" y="${f(verts[i + 1])}" z="${f(verts[i + 2])}"/>`);
+    const vXml = parts.join("");
+    parts.length = 0;
+    for (let i = 0; i < tris.length; i += 3) parts.push(`<triangle v1="${tris[i]}" v2="${tris[i + 1]}" v3="${tris[i + 2]}"/>`);
+    const material = colored ? ` pid="1" pindex="${index}"` : "";
+    resources.push(`<object id="${index + 2}" type="model" name="${escapeXml(o.name)}"${material}>
+      <mesh><vertices>${vXml}</vertices><triangles>${parts.join("")}</triangles></mesh>
+    </object>`);
+  });
 
   const model = `<?xml version="1.0" encoding="UTF-8"?>
 <model unit="millimeter" xml:lang="es-ES" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
   <metadata name="Title">${escapeXml(name)}</metadata>
   <metadata name="Application">AI3D</metadata>
   <resources>
-    <object id="1" type="model" name="${escapeXml(name)}">
-      <mesh><vertices>${vXml}</vertices><triangles>${tXml}</triangles></mesh>
-    </object>
+    ${resources.join("\n    ")}
   </resources>
-  <build><item objectid="1"/></build>
+  <build>${objects.map((_, i) => `<item objectid="${i + 2}"/>`).join("")}</build>
 </model>`;
 
   return zipSync({

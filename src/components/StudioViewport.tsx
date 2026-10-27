@@ -1,13 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { GizmoHelper, GizmoViewport, OrbitControls, TransformControls } from "@react-three/drei";
 import * as THREE from "three";
-import { AlertTriangle, ArrowDownToLine, Copy, Eye, Grid3x3, Layers, Loader2, Magnet, Move3d, Rotate3d, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDownToLine, Copy, Eye, Grid3x3, Layers, Loader2, Magnet, Move3d, RefreshCw, Rotate3d, Ruler, Trash2, X } from "lucide-react";
 import type { MeshPayload } from "../cad/client";
+import { partPreviewScale } from "../cad/importScale";
 import type { Part } from "../cad/types";
 import { usePartMesh } from "../studio/meshes";
+import { bodyColors } from "../studio/parts";
+import { useTools } from "../studio/tools";
 import { thumbnailHook, useStore } from "../store";
 import { IconButton, cx } from "./ui";
+import { Dimensions, SelectedEdges, ToolPanel, handlePick } from "./ViewportTools";
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 const DEG = Math.PI / 180;
@@ -76,18 +80,22 @@ function PlateGrid({ size, minor, major, outline }: { size: number; minor: strin
 }
 
 function PartObject({ part, selected, edgeColor, dimmed, register }: { part: Part; selected: boolean; edgeColor: string; dimmed: boolean; register: (id: string, o: THREE.Object3D | null) => void }) {
-  const entry = usePartMesh(part.type, part.params);
+  const entry = usePartMesh(part.type, part.params, part.features);
+  const pickingEdges = useTools((s) => s.mode?.kind === "edges" && s.mode.partId === part.id);
   const geo = useGeometry(entry?.mesh);
   const select = useStore((s) => s.select);
   const hole = part.mode === "hole";
+  const attach = useCallback((o: THREE.Object3D | null) => register(part.id, o), [part.id, register]);
   if (part.hidden) return null;
 
   return (
     <group
-      ref={(o) => register(part.id, o)}
+      ref={attach}
       position={part.position}
+      scale={partPreviewScale(part)}
       rotation={new THREE.Euler(part.rotation[0] * DEG, part.rotation[1] * DEG, part.rotation[2] * DEG, "ZYX")}
       onClick={(e) => {
+        if (entry?.mesh && handlePick(e, { mesh: entry.mesh, part })) return;
         e.stopPropagation();
         select(part.id);
       }}
@@ -96,6 +104,7 @@ function PartObject({ part, selected, edgeColor, dimmed, register }: { part: Par
         <>
           <mesh geometry={geo.faces} castShadow={!hole} receiveShadow>
             <meshStandardMaterial
+              flatShading={entry?.mesh?.exact === false}
               color={hole ? "#f87171" : part.color}
               roughness={0.55}
               metalness={0.05}
@@ -112,20 +121,44 @@ function PartObject({ part, selected, edgeColor, dimmed, register }: { part: Par
           <lineSegments geometry={geo.edges}>
             <lineBasicMaterial color={selected ? "#ffffff" : hole ? "#f87171" : edgeColor} transparent opacity={selected ? 0.9 : 0.45} />
           </lineSegments>
+          {pickingEdges && entry?.mesh && <SelectedEdges mesh={entry.mesh} />}
         </>
       )}
     </group>
   );
 }
 
+/** Resultado combinado: cada cuerpo con el color de su primera pieza. */
 function ResultObject({ mesh, color, edgeColor }: { mesh: MeshPayload; color: string; edgeColor: string }) {
   const geo = useGeometry(mesh);
+  const parts = useStore((s) => s.doc?.parts);
+  const bodies = useMemo(() => mesh.bodies ?? [], [mesh]);
+  const materials = useMemo(() => {
+    const colors = parts ? bodyColors(parts) : {};
+    const list = (bodies.length ? bodies : [{ name: "" }]).map((b) => new THREE.MeshStandardMaterial({ color: colors[b.name] ?? color, flatShading: !mesh.exact, roughness: 0.5, metalness: 0.05, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
+    return list;
+  }, [parts, bodies, color, mesh.exact]);
+  useEffect(() => () => materials.forEach((m) => m.dispose()), [materials]);
+  // Los grupos se fijan antes del primer render (el lienzo solo dibuja bajo demanda).
+  useMemo(() => {
+    if (!geo) return;
+    geo.faces.clearGroups();
+    if (bodies.length) bodies.forEach((b, i) => geo.faces.addGroup(b.triStart * 3, b.triCount * 3, i));
+    else geo.faces.addGroup(0, mesh.triangles.length, 0);
+  }, [geo, bodies, mesh]);
   if (!geo) return null;
   return (
     <group>
-      <mesh geometry={geo.faces} castShadow receiveShadow>
-        <meshStandardMaterial color={color} roughness={0.5} metalness={0.05} polygonOffset polygonOffsetFactor={1} polygonOffsetUnits={1} />
-      </mesh>
+      <mesh
+        geometry={geo.faces}
+        material={materials}
+        castShadow
+        receiveShadow
+        onClick={(e) => {
+          const body = bodies.find((b) => e.faceIndex! >= b.triStart && e.faceIndex! < b.triStart + b.triCount)?.name;
+          handlePick(e, { mesh, body });
+        }}
+      />
       <lineSegments geometry={geo.edges}>
         <lineBasicMaterial color={edgeColor} transparent opacity={0.5} />
       </lineSegments>
@@ -205,6 +238,10 @@ export function StudioViewport() {
   const building = useStore((s) => s.building);
   const buildError = useStore((s) => s.buildError);
   const buildVolume = useStore((s) => s.settings.buildVolume);
+  const retryBuild = useStore((s) => s.retryBuild);
+  const cancelBuild = useStore((s) => s.cancelBuild);
+  const toolMode = useTools((s) => s.mode);
+  const setToolMode = useTools((s) => s.setMode);
   const colors = useCssColors();
   const [view, setView] = useState<View>("iso");
   const [nonce, setNonce] = useState(0);
@@ -215,12 +252,15 @@ export function StudioViewport() {
   const [, force] = useState(0);
   const selected = parts.find((p) => p.id === selectedId) ?? null;
 
-  const register = (id: string, o: THREE.Object3D | null) => {
+  // Ref callbacks must stay stable: detaching and reattaching a selected object
+  // on every render otherwise schedules another render indefinitely.
+  const register = useCallback((id: string, o: THREE.Object3D | null) => {
     const had = objects.current.get(id);
+    if (had === o || (!had && !o)) return;
     if (o) objects.current.set(id, o);
     else objects.current.delete(id);
-    if (!had && o && id === selectedId) force((n) => n + 1);
-  };
+    if (id === useStore.getState().selectedId) force((n) => n + 1);
+  }, []);
 
   const dims = result ? result.bbox.max.map((v, i) => v - result.bbox.min[i]) : null;
   const tooBig = dims ? dims.some((d) => d > buildVolume) : false;
@@ -251,7 +291,10 @@ export function StudioViewport() {
       } else if ((e.key === "Delete" || e.key === "Backspace") && s.selectedId) {
         e.preventDefault();
         s.removePart(s.selectedId);
-      } else if (e.key === "Escape") s.select(null);
+      } else if (e.key === "Escape") {
+        if (useTools.getState().mode) useTools.getState().setMode(null);
+        else s.select(null);
+      } else if (!mod && e.key.toLowerCase() === "m") useTools.getState().setMode(useTools.getState().mode?.kind === "measure" ? null : { kind: "measure", target: "point" });
       else if (!mod && e.key.toLowerCase() === "w") s.setTransformMode("translate");
       else if (!mod && e.key.toLowerCase() === "e") s.setTransformMode("rotate");
       else if (!mod && e.key.toLowerCase() === "h" && s.selectedId) {
@@ -263,7 +306,7 @@ export function StudioViewport() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const target = selected && !showResult ? objects.current.get(selected.id) : undefined;
+  const target = selected && !showResult && !toolMode ? objects.current.get(selected.id) : undefined;
 
   const syncFromObject = () => {
     if (!selected || !target) return;
@@ -295,10 +338,18 @@ export function StudioViewport() {
         void importFiles([...e.dataTransfer.files]);
       }}
     >
-      <Canvas shadows dpr={[1, 2]} camera={{ fov: 35, position: [180, -220, 160], up: [0, 0, 1] }} gl={{ antialias: true, preserveDrawingBuffer: true }} onPointerMissed={(e) => e.button === 0 && select(null)}>
+      <Canvas
+        frameloop="demand"
+        shadows
+        dpr={[1, 1.5]}
+        resize={{ scroll: false, debounce: { resize: 120, scroll: 0 } }}
+        camera={{ fov: 35, position: [180, -220, 160], up: [0, 0, 1] }}
+        gl={{ antialias: true, preserveDrawingBuffer: false }}
+        onPointerMissed={(e) => e.button === 0 && !useTools.getState().mode && select(null)}
+      >
         <color attach="background" args={[colors.bg]} />
         <hemisphereLight args={["#ffffff", "#30343c", 1.4]} />
-        <directionalLight position={[120, -160, 260]} intensity={1.6} castShadow shadow-mapSize={[2048, 2048]} />
+        <directionalLight position={[120, -160, 260]} intensity={1.6} castShadow shadow-mapSize={[1024, 1024]} />
         <directionalLight position={[-140, 100, 80]} intensity={0.45} />
         {showGrid && <PlateGrid size={buildVolume} minor={colors.grid} major={colors.border} outline={tooBig ? "#f87171" : colors.border} />}
         {showResult && result ? (
@@ -317,6 +368,7 @@ export function StudioViewport() {
             onObjectChange={syncFromObject}
           />
         )}
+        <Dimensions />
         <OrbitControls makeDefault enableDamping dampingFactor={0.12} />
         <CameraRig view={view} nonce={nonce} radius={radius} center={center} />
         <ThumbnailRegistrar />
@@ -354,6 +406,10 @@ export function StudioViewport() {
           </IconButton>
           <IconButton label="Eliminar (Supr)" disabled={!selected} onClick={() => selected && removePart(selected.id)} className="disabled:opacity-35">
             <Trash2 size={16} />
+          </IconButton>
+          <div className="mx-1 h-5 w-px bg-line" />
+          <IconButton label="Medir (M)" active={toolMode?.kind === "measure"} onClick={() => setToolMode(toolMode?.kind === "measure" ? null : { kind: "measure", target: "point" })}>
+            <Ruler size={16} />
           </IconButton>
         </div>
 
@@ -401,8 +457,11 @@ export function StudioViewport() {
           </span>
         )}
         {building && (
-          <span className="flex items-center gap-1.5 rounded-lg border border-line bg-surface/85 px-2.5 py-1.5 backdrop-blur">
+          <span className="pointer-events-auto flex items-center gap-1.5 rounded-lg border border-line bg-surface/85 px-2.5 py-1.5 backdrop-blur">
             <Loader2 size={12} className="animate-spin" /> Calculando
+            <button aria-label="Cancelar cálculo" title="Cancelar cálculo" onClick={cancelBuild} className="ml-0.5 text-faint hover:text-fg cursor-pointer">
+              <X size={12} />
+            </button>
           </span>
         )}
       </div>
@@ -427,8 +486,12 @@ export function StudioViewport() {
             <AlertTriangle size={14} /> No se pudo combinar la escena
           </div>
           <div className="mt-1 text-muted">{buildError}</div>
+          <button onClick={retryBuild} className="mt-2 flex items-center gap-1.5 text-[12px] font-medium text-fg hover:text-accent-text cursor-pointer">
+            <RefreshCw size={12} /> Reintentar
+          </button>
         </div>
       )}
+      <ToolPanel />
     </section>
   );
 }

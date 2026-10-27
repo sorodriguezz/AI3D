@@ -25,3 +25,11 @@ dist-ssr
 
 # Configuración local de Claude Code
 .claude/
+
+# Browser regression tests
+test-results/
+playwright-report/
+
+# Python release tooling
+__pycache__/
+*.pyc
