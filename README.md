@@ -76,9 +76,11 @@ Para añadir una forma, agrega sus metadatos en `src/cad/templates.ts` y su geom
 Configuración inicial (una sola vez):
 
 1. Crea el repo `github.com/sorodriguezz/AI3D`. Si usas otro nombre, cambia `plugins.updater.endpoints` en `src-tauri/tauri.conf.json`, y los enlaces de este README y de `src/lib/updates.ts`.
-2. En *Settings → Secrets and variables → Actions*, crea dos secretos:
-   - `TAURI_SIGNING_PRIVATE_KEY`, con el contenido de `~/.tauri/ai3d.key`;
-   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, vacío.
+2. Crea el secreto `TAURI_SIGNING_PRIVATE_KEY` con el contenido de `~/.tauri/ai3d.key` (la clave no tiene contraseña; GitHub no admite secretos vacíos y el workflow usa una cadena vacía):
+
+   ```bash
+   gh secret set TAURI_SIGNING_PRIVATE_KEY -R sorodriguezz/AI3D < ~/.tauri/ai3d.key
+   ```
 
    **No pierdas esa clave:** sin ella, las versiones instaladas no aceptarán actualizaciones nuevas.
 
