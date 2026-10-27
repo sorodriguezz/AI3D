@@ -10,7 +10,9 @@ export default defineConfig(() => ({
   plugins: [react(), tailwindcss()],
 
   // OpenCascade se carga como WebAssembly dentro de un Web Worker.
-  optimizeDeps: { exclude: ["replicad-opencascadejs"] },
+  // Las dependencias del worker se preempaquetan al arrancar: si Vite las descubre al cargar
+  // el worker, recarga la página (en un arranque en frío se pierde lo que se estaba haciendo).
+  optimizeDeps: { exclude: ["replicad-opencascadejs"], include: ["replicad", "manifold-3d"] },
   worker: { format: "es" as const },
   build: { target: "es2022", chunkSizeWarningLimit: 4000 },
 
