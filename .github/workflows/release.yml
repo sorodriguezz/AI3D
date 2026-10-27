@@ -1,0 +1,129 @@
+name: release
+
+# Sube una etiqueta como v0.2.0 (ver scripts/bump_version.py) para compilar, firmar y publicar.
+# La Release empieza como borrador; cada plataforma sube su instalador y su paquete de
+# actualización. Solo cuando están las tres se publica, así releases/latest/download/latest.json
+# (lo que lee el actualizador de la app) nunca apunta a una versión sin el sistema del usuario.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      # El id sale directamente de la creación; listar releases justo después puede no encontrarla.
+      - id: draft
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          body=$(printf '%s\n' \
+            "## Descargar AI3D $TAG" \
+            "" \
+            "| Sistema | Instalador |" \
+            "| --- | --- |" \
+            "| macOS (Apple Silicon: M1, M2, M3, M4) | [AI3D-macOS-AppleSilicon.dmg]($base/AI3D-macOS-AppleSilicon.dmg) |" \
+            "| Windows (Intel / AMD, x64) | [AI3D-Windows-x64-setup.exe]($base/AI3D-Windows-x64-setup.exe) |" \
+            "| Windows ARM (Snapdragon, ARM64) | [AI3D-Windows-ARM64-setup.exe]($base/AI3D-Windows-ARM64-setup.exe) |" \
+            "" \
+            "Si ya tienes AI3D, se actualiza sola desde la app." \
+            "" \
+            "**macOS:** la primera vez, permite la app en *Ajustes del Sistema → Privacidad y seguridad*. **Windows:** si aparece SmartScreen, pulsa *Más información → Ejecutar de todas formas*.")
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG" -f name="AI3D $TAG" \
+            -F draft=true -f body="$body" --jq .id)
+          [ -n "$id" ] || exit 1
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Firma de las actualizaciones (ed25519), no firma de sistema operativo.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --target ${{ matrix.target }}
+          releaseId: ${{ needs.create-release.outputs.id }}
+          includeUpdaterJson: true
+
+  publish-release:
+    needs: [create-release, publish]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      ID: ${{ needs.create-release.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+      # Un borrador no se puede buscar por etiqueta, así que todo va por su id.
+      - name: Rebuild latest.json from the signed bundles
+        run: |
+          mkdir sigs
+          gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --paginate \
+            --jq '.[] | select(.name | endswith(".sig")) | "\(.id) \(.name)"' |
+          while read -r aid name; do
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > "sigs/$name"
+          done
+          ls sigs
+          python3 scripts/updater_manifest.py "$TAG" "$GITHUB_REPOSITORY" sigs
+          old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --paginate --jq '.[] | select(.name == "latest.json") | .id')
+          [ -z "$old" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          gh api -X POST -H "Content-Type: application/json" --input latest.json \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=latest.json" > /dev/null
+
+      # Copias con nombre fijo: releases/latest/download/<nombre> siempre lleva a la última versión
+      # de cada sistema, así el README y cualquier web pueden enlazar la descarga directa.
+      - name: Upload installers with stable names
+        run: |
+          assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --paginate --jq '.[] | "\(.id) \(.name)"')
+          upload() {
+            pattern="$1"; stable="$2"
+            line=$(echo "$assets" | awk -v p="$pattern" '$2 ~ p {print; exit}')
+            [ -n "$line" ] || { echo "falta un instalador que coincida con $pattern"; exit 1; }
+            aid=${line%% *}
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$aid" > "$stable"
+            gh api -X POST -H "Content-Type: application/octet-stream" --input "$stable" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=$stable" > /dev/null
+            echo "$stable <- ${line#* }"
+          }
+          upload '_aarch64\\.dmg$' AI3D-macOS-AppleSilicon.dmg
+          upload '_x64-setup\\.exe$' AI3D-Windows-x64-setup.exe
+          upload '_arm64-setup\\.exe$' AI3D-Windows-ARM64-setup.exe
+
+      - name: Publish
+        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -f make_latest=true > /dev/null
